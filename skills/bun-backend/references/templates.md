@@ -1,23 +1,59 @@
 # Bun Backend Production Templates & Reference Implementations
 
-This document provides production-ready reference implementations for foundational files and feature slices following the **bun-backend** skill standards.
+This document provides complete, production-ready reference implementations for foundational files and feature slices following the **bun-backend** skill standards.
 
 ---
 
 ## 1. Application Entry & Bootstrap
 
-### `src/index.ts` (Bun Server Entrypoint)
+### `src/index.ts` (Bun Server Entrypoint with Graceful Shutdown)
 ```typescript
 import { app } from "@/app";
 import { env } from "@/config/env.config";
+import { pool } from "@/db";
+import { redis } from "@/lib/redis";
+import { emailWorker } from "@/queues";
 import { logger } from "@/lib/logger";
 
-export default {
+const server = Bun.serve({
   port: env.PORT,
   fetch: app.fetch,
-};
+});
 
 logger.info(`Server running on port ${env.PORT}`);
+
+// Graceful Shutdown Handler
+const shutdown = async (signal: string) => {
+  logger.info(`Received ${signal}. Starting graceful shutdown...`);
+
+  // Stop accepting new connections
+  server.stop();
+
+  try {
+    // 1. Close BullMQ workers
+    logger.info("Closing queue workers...");
+    await emailWorker.close();
+
+    // 2. Drain and close database pool
+    logger.info("Draining database connections...");
+    await pool.end();
+
+    // 3. Disconnect Redis
+    logger.info("Closing Redis connection...");
+    await redis.quit();
+
+    logger.info("Graceful shutdown completed successfully.");
+    process.exit(0);
+  } catch (error) {
+    logger.error("Error during graceful shutdown:", error);
+    process.exit(1);
+  }
+};
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+export default server;
 ```
 
 ### `src/types/context.ts` (Strongly Typed Hono Environment)
@@ -42,6 +78,7 @@ export type AppEnv = {
 ```typescript
 import { Hono } from "hono";
 import type { AppEnv } from "@/types/context";
+import { requestIdMiddleware } from "@/middlewares/requestId.middleware";
 import { corsMiddleware } from "@/middlewares/cors.middleware";
 import { loggerMiddleware } from "@/middlewares/logger.middleware";
 import { errorHandler } from "@/middlewares/errorHandler.middleware";
@@ -51,6 +88,7 @@ import Router from "@/routes";
 export const app = new Hono<AppEnv>();
 
 // Global Middlewares
+app.use("*", requestIdMiddleware);
 app.use("*", corsMiddleware);
 app.use("*", loggerMiddleware);
 
@@ -287,7 +325,7 @@ redis.on("error", (err) => {
 });
 ```
 
-### `src/lib/logger.ts` (Colorized ANSI Logger)
+### `src/lib/logger.ts` (Colorized ANSI Logger with Request ID)
 ```typescript
 const isDevelopment = process.env.NODE_ENV === "development";
 
@@ -338,11 +376,23 @@ export async function tryCatch<T, E = Error>(
 
 ## 4. Middlewares (`src/middlewares/`)
 
+### `src/middlewares/requestId.middleware.ts` (Request Correlation ID)
+```typescript
+import type { Context, Next } from "hono";
+
+export const requestIdMiddleware = async (c: Context, next: Next) => {
+  // Use client/proxy header or generate a new UUIDv7
+  const requestId = c.req.header("X-Request-Id") || crypto.randomUUID();
+  c.set("requestId", requestId);
+  c.header("X-Request-Id", requestId);
+  await next();
+};
+```
+
 ### `src/middlewares/auth.middleware.ts` (JWT Bearer Token Auth)
 ```typescript
 import type { Context, Next } from "hono";
 import { AuthorizationError } from "@/lib/error";
-import { env } from "@/config/env.config";
 import type { AuthUser } from "@/types/context";
 
 export const authMiddleware = async (c: Context, next: Next) => {
@@ -354,7 +404,6 @@ export const authMiddleware = async (c: Context, next: Next) => {
   const token = authHeader.substring(7);
 
   try {
-    // Standard HMAC-SHA256 JWT verify (or using jose/jsonwebtoken)
     const [headerB64, payloadB64, signature] = token.split(".");
     if (!headerB64 || !payloadB64 || !signature) {
       throw new Error("Malformed token");
@@ -454,26 +503,28 @@ import Response from "@/lib/response";
 import { ZodError } from "zod";
 
 export const errorHandler = (error: any, c: Context) => {
+  const reqId = c.get("requestId") ? `[Req: ${c.get("requestId")}] ` : "";
+
   // Handle AppError
   if (error instanceof AppError) {
-    logger.error(error.message);
+    logger.error(`${reqId}${error.message}`);
     return Response.error(c, error.code, error.message, error.status);
   }
 
   // Handle unhandled Zod errors
   if (error instanceof ZodError) {
     const message = error.issues[0]?.message || "Validation failed";
-    logger.error(`Validation Error: ${message}`);
+    logger.error(`${reqId}Validation Error: ${message}`);
     return Response.error(c, "VALIDATION_ERROR", message, 422);
   }
 
   // Handle malformed JSON body errors
   if (error.message && error.message.includes("JSON")) {
-    logger.error(error.message);
+    logger.error(`${reqId}${error.message}`);
     return Response.error(c, "BAD_REQUEST", "Invalid JSON", 400);
   }
 
-  logger.error("[CRITICAL]", error?.stack || error?.message || error);
+  logger.error(`${reqId}[CRITICAL]`, error?.stack || error?.message || error);
   return Response.error(c, "SERVER_ERROR", "Internal Server Error", 500);
 };
 ```
@@ -484,10 +535,11 @@ import type { Context, Next } from "hono";
 import { logger } from "@/lib/logger";
 
 export const loggerMiddleware = async (c: Context, next: Next) => {
+  const reqId = c.get("requestId") ? `[${c.get("requestId")}] ` : "";
   const { method, path } = c.req;
   await next();
   const status = c.res.status;
-  logger.info(`[${method}] ${path} [${status}]`);
+  logger.info(`${reqId}[${method}] ${path} [${status}]`);
 };
 ```
 
@@ -499,7 +551,7 @@ import { cors } from "hono/cors";
 export const corsMiddleware = cors({
   origin: isDevelopment ? "*" : [],
   allowMethods: ["POST", "GET", "OPTIONS", "PUT", "DELETE", "PATCH"],
-  allowHeaders: ["Accept", "Content-Type", "Authorization"],
+  allowHeaders: ["Accept", "Content-Type", "Authorization", "X-Request-Id"],
   maxAge: 600,
 });
 ```
@@ -508,6 +560,23 @@ export const corsMiddleware = cors({
 
 ## 5. Database Layer (`src/db/`)
 
+### `src/db/helpers/columns.ts` (Standard Schema Helpers)
+```typescript
+import { timestamp, uuid } from "drizzle-orm/pg-core";
+
+/** Shared UUIDv7 primary key */
+export const primaryKeyUuidV7 = () => uuid("id").defaultRandom().primaryKey();
+
+/** Shared timestamps with auto-updated updatedAt */
+export const timestamps = {
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .defaultNow()
+    .$onUpdate(() => new Date())
+    .notNull(),
+};
+```
+
 ### `src/db/index.ts` (Drizzle Client & Pool)
 ```typescript
 import { env } from "@/config/env.config";
@@ -515,7 +584,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as schema from "./schemas";
 
-const pool = new Pool({
+export const pool = new Pool({
   connectionString: env.POSTGRESQL_URL,
   options: `-c timezone=${env.TZ}`,
 });
@@ -530,15 +599,15 @@ export default db;
 
 ### `src/db/schemas/users.schema.ts`
 ```typescript
-import { pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { pgTable, text } from "drizzle-orm/pg-core";
+import { primaryKeyUuidV7, timestamps } from "../helpers/columns";
 
 export const users = pgTable("users", {
-  id: uuid("id").defaultRandom().primaryKey(),
+  id: primaryKeyUuidV7(),
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
   fullName: text("full_name").notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  ...timestamps,
 });
 
 export type User = typeof users.$inferSelect;
@@ -553,13 +622,14 @@ export * from "./users.schema";
 ### `src/db/scripts/migrate.ts`
 ```typescript
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import db from "../index";
+import db, { pool } from "../index";
 import { logger } from "@/lib/logger";
 
 async function runMigrations() {
   logger.info("Running pending database migrations...");
   await migrate(db, { migrationsFolder: "./drizzle" });
   logger.info("Migrations applied successfully.");
+  await pool.end();
   process.exit(0);
 }
 
@@ -571,7 +641,7 @@ runMigrations().catch((err) => {
 
 ### `src/db/scripts/seed.ts`
 ```typescript
-import db from "../index";
+import db, { pool } from "../index";
 import { users } from "../schemas";
 import { logger } from "@/lib/logger";
 
@@ -586,6 +656,7 @@ async function seed() {
   }).onConflictDoNothing();
 
   logger.info("Seeding complete.");
+  await pool.end();
   process.exit(0);
 }
 
@@ -627,9 +698,9 @@ import { z } from "zod";
 import { paginationQuerySchema } from "@/lib/pagination";
 
 export const createUserSchema = z.object({
-  email: z.string().email("Invalid email address"),
+  email: z.string().trim().toLowerCase().email("Invalid email address"),
   password: z.string().min(8, "Password must be at least 8 characters"),
-  fullName: z.string().min(2, "Full name must be at least 2 characters"),
+  fullName: z.string().trim().min(2, "Full name must be at least 2 characters"),
 });
 
 export const userIdParamSchema = z.object({
@@ -637,12 +708,39 @@ export const userIdParamSchema = z.object({
 });
 
 export const listUsersQuerySchema = paginationQuerySchema.extend({
-  search: z.string().optional(),
+  search: z.string().trim().optional(),
 });
 
 export type CreateUserInput = z.infer<typeof createUserSchema>;
 export type UserIdParam = z.infer<typeof userIdParamSchema>;
 export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
+```
+
+### `src/features/users/mappers/index.ts` (DTO Serialization)
+```typescript
+import type { User } from "@/db/schemas";
+
+export type UserResponseDTO = {
+  id: string;
+  email: string;
+  fullName: string;
+  createdAt: string;
+};
+
+export class UserMapper {
+  static toResponse(user: User): UserResponseDTO {
+    return {
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+      createdAt: user.createdAt.toISOString(),
+    };
+  }
+
+  static toResponseList(users: User[]): UserResponseDTO[] {
+    return users.map(this.toResponse);
+  }
+}
 ```
 
 ### `src/features/users/repositories/index.ts`
@@ -699,7 +797,6 @@ export class UsersRepository {
 ```typescript
 import db from "@/db";
 import { ConflictError, NotFoundError } from "@/lib/error";
-import { formatPaginatedResult } from "@/lib/pagination";
 import { emailQueue } from "@/queues";
 import { UsersRepository } from "../repositories";
 import type { CreateUserInput, ListUsersQuery } from "../schemas";
@@ -710,9 +807,7 @@ export class UsersService {
     if (!user) {
       throw new NotFoundError(`User with id '${id}' not found`);
     }
-
-    const { passwordHash, ...safeUser } = user;
-    return safeUser;
+    return user;
   }
 
   static async create(input: CreateUserInput) {
@@ -724,8 +819,8 @@ export class UsersService {
     const passwordHash = await Bun.password.hash(input.password, { algorithm: "argon2id" });
 
     // Multi-table or atomic operations orchestrate db.transaction
-    const safeUser = await db.transaction(async (tx) => {
-      const created = await UsersRepository.create(
+    const createdUser = await db.transaction(async (tx) => {
+      return UsersRepository.create(
         {
           email: input.email,
           fullName: input.fullName,
@@ -733,22 +828,16 @@ export class UsersService {
         },
         tx,
       );
-
-      const { passwordHash: _, ...user } = created;
-      return user;
     });
 
     // Offload async heavy task to BullMQ
-    await emailQueue.add("welcomeEmail", { email: safeUser.email, name: safeUser.fullName });
+    await emailQueue.add("welcomeEmail", { email: createdUser.email, name: createdUser.fullName });
 
-    return safeUser;
+    return createdUser;
   }
 
   static async list(query: ListUsersQuery) {
-    const { items, total } = await UsersRepository.list(query.page, query.limit);
-    const safeItems = items.map(({ passwordHash, ...user }) => user);
-
-    return formatPaginatedResult(safeItems, total, query.page, query.limit);
+    return UsersRepository.list(query.page, query.limit);
   }
 }
 ```
@@ -761,6 +850,8 @@ import { validateBody, validateParams, validateQuery } from "@/middlewares/valid
 import { authMiddleware } from "@/middlewares/auth.middleware";
 import { createUserSchema, userIdParamSchema, listUsersQuerySchema } from "../schemas";
 import { UsersService } from "../services";
+import { UserMapper } from "../mappers";
+import { formatPaginatedResult } from "@/lib/pagination";
 import Response from "@/lib/response";
 
 const router = new Hono<AppEnv>();
@@ -769,7 +860,8 @@ const router = new Hono<AppEnv>();
 router.post("/", validateBody(createUserSchema), async (c) => {
   const input = c.req.valid("json");
   const user = await UsersService.create(input);
-  return Response.success(c, user, "User registered successfully", 201);
+  const response = UserMapper.toResponse(user);
+  return Response.success(c, response, "User registered successfully", 201);
 });
 
 // Protected routes
@@ -777,14 +869,17 @@ router.use("*", authMiddleware);
 
 router.get("/", validateQuery(listUsersQuerySchema), async (c) => {
   const query = c.req.valid("query");
-  const paginatedUsers = await UsersService.list(query);
-  return Response.success(c, paginatedUsers);
+  const { items, total } = await UsersService.list(query);
+  const safeItems = UserMapper.toResponseList(items);
+  const paginated = formatPaginatedResult(safeItems, total, query.page, query.limit);
+  return Response.success(c, paginated);
 });
 
 router.get("/:id", validateParams(userIdParamSchema), async (c) => {
   const { id } = c.req.valid("param");
   const user = await UsersService.getById(id);
-  return Response.success(c, user);
+  const response = UserMapper.toResponse(user);
+  return Response.success(c, response);
 });
 
 export default router;
@@ -797,13 +892,16 @@ export default router;
 ### `tests/setup.ts` (Test Runner Setup)
 ```typescript
 import { beforeAll, afterAll } from "bun:test";
+import { pool } from "@/db";
+import { redis } from "@/lib/redis";
 
 beforeAll(async () => {
-  // Setup test database or run migrations
+  // Setup test database / migrations if necessary
 });
 
 afterAll(async () => {
-  // Teardown connections
+  await pool.end();
+  await redis.quit();
 });
 ```
 
