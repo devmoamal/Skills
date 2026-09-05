@@ -20,16 +20,35 @@ export default {
 logger.info(`Server running on port ${env.PORT}`);
 ```
 
+### `src/types/context.ts` (Strongly Typed Hono Environment)
+```typescript
+export type AuthUser = {
+  id: string;
+  email: string;
+  role: "admin" | "user";
+};
+
+export type AppVariables = {
+  user: AuthUser;
+  requestId: string;
+};
+
+export type AppEnv = {
+  Variables: AppVariables;
+};
+```
+
 ### `src/app/index.ts` (Hono Application Setup)
 ```typescript
 import { Hono } from "hono";
+import type { AppEnv } from "@/types/context";
 import { corsMiddleware } from "@/middlewares/cors.middleware";
 import { loggerMiddleware } from "@/middlewares/logger.middleware";
 import { errorHandler } from "@/middlewares/errorHandler.middleware";
 import { NotFoundError } from "@/lib/error";
 import Router from "@/routes";
 
-export const app = new Hono();
+export const app = new Hono<AppEnv>();
 
 // Global Middlewares
 app.use("*", corsMiddleware);
@@ -48,9 +67,10 @@ app.route("/", Router);
 ### `src/routes/index.ts` (Central Route Aggregator)
 ```typescript
 import { Hono } from "hono";
+import type { AppEnv } from "@/types/context";
 import usersRouter from "@/features/users/routes";
 
-const router = new Hono();
+const router = new Hono<AppEnv>();
 
 router.get("/health", (c) => c.json({ status: "ok" }));
 router.route("/users", usersRouter);
@@ -71,6 +91,8 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(3000),
   TZ: z.string().default("Asia/Baghdad"),
   POSTGRESQL_URL: z.string().min(1, "POSTGRESQL_URL is required"),
+  REDIS_URL: z.string().default("redis://localhost:6379"),
+  JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
   DASHBOARD_URL: z.string().optional(),
 });
 
@@ -107,6 +129,7 @@ export type ErrorCode =
   | "FORBIDDEN"
   | "BAD_REQUEST"
   | "CONFLICT"
+  | "RATE_LIMITED"
   | "SERVER_ERROR";
 
 export class AppError extends Error {
@@ -153,6 +176,12 @@ export class BadRequestError extends AppError {
 export class ConflictError extends AppError {
   constructor(message = "Conflict") {
     super(message, 409, "CONFLICT");
+  }
+}
+
+export class RateLimitError extends AppError {
+  constructor(message = "Too Many Requests") {
+    super(message, 429, "RATE_LIMITED");
   }
 }
 
@@ -208,6 +237,56 @@ class Response {
 export default Response;
 ```
 
+### `src/lib/pagination.ts` (Offset Pagination Standard)
+```typescript
+import { z } from "zod";
+
+export const paginationQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+export type PaginationQuery = z.infer<typeof paginationQuerySchema>;
+
+export type PaginatedResult<T> = {
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+};
+
+export function formatPaginatedResult<T>(
+  items: T[],
+  total: number,
+  page: number,
+  limit: number,
+): PaginatedResult<T> {
+  return {
+    items,
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+  };
+}
+```
+
+### `src/lib/redis.ts` (Shared Redis Client)
+```typescript
+import Redis from "ioredis";
+import { env } from "@/config/env.config";
+import { logger } from "@/lib/logger";
+
+export const redis = new Redis(env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+});
+
+redis.on("error", (err) => {
+  logger.error("Redis connection error:", err);
+});
+```
+
 ### `src/lib/logger.ts` (Colorized ANSI Logger)
 ```typescript
 const isDevelopment = process.env.NODE_ENV === "development";
@@ -259,6 +338,74 @@ export async function tryCatch<T, E = Error>(
 
 ## 4. Middlewares (`src/middlewares/`)
 
+### `src/middlewares/auth.middleware.ts` (JWT Bearer Token Auth)
+```typescript
+import type { Context, Next } from "hono";
+import { AuthorizationError } from "@/lib/error";
+import { env } from "@/config/env.config";
+import type { AuthUser } from "@/types/context";
+
+export const authMiddleware = async (c: Context, next: Next) => {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    throw new AuthorizationError("Missing or invalid Authorization header");
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    // Standard HMAC-SHA256 JWT verify (or using jose/jsonwebtoken)
+    const [headerB64, payloadB64, signature] = token.split(".");
+    if (!headerB64 || !payloadB64 || !signature) {
+      throw new Error("Malformed token");
+    }
+
+    const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString());
+
+    if (payload.exp && Date.now() >= payload.exp * 1000) {
+      throw new AuthorizationError("Token has expired");
+    }
+
+    const user: AuthUser = {
+      id: payload.sub,
+      email: payload.email,
+      role: payload.role || "user",
+    };
+
+    c.set("user", user);
+    await next();
+  } catch (error) {
+    if (error instanceof AuthorizationError) throw error;
+    throw new AuthorizationError("Invalid token");
+  }
+};
+```
+
+### `src/middlewares/rateLimit.middleware.ts` (Redis Sliding Window)
+```typescript
+import type { Context, Next } from "hono";
+import { redis } from "@/lib/redis";
+import { RateLimitError } from "@/lib/error";
+
+export const rateLimiter = (options: { limit: number; windowSeconds: number }) => {
+  return async (c: Context, next: Next) => {
+    const ip = c.req.header("x-forwarded-for") || "127.0.0.1";
+    const key = `ratelimit:${ip}:${c.req.path}`;
+
+    const current = await redis.incr(key);
+    if (current === 1) {
+      await redis.expire(key, options.windowSeconds);
+    }
+
+    if (current > options.limit) {
+      throw new RateLimitError(`Rate limit exceeded. Try again in ${options.windowSeconds}s.`);
+    }
+
+    await next();
+  };
+};
+```
+
 ### `src/middlewares/validate.middleware.ts`
 ```typescript
 import { ValidationError } from "@/lib/error";
@@ -301,7 +448,7 @@ export const validateFormData = <T extends z.ZodTypeAny>(schema: T) =>
 ### `src/middlewares/errorHandler.middleware.ts`
 ```typescript
 import type { Context } from "hono";
-import { AppError, BadRequestError, ValidationError } from "@/lib/error";
+import { AppError, BadRequestError } from "@/lib/error";
 import { logger } from "@/lib/logger";
 import Response from "@/lib/response";
 import { ZodError } from "zod";
@@ -450,11 +597,34 @@ seed().catch((err) => {
 
 ---
 
-## 6. Complete Feature Reference Slice (`src/features/users/`)
+## 6. Background Processing & Queues (`src/queues/`)
+
+### `src/queues/index.ts` (BullMQ Queues & Workers)
+```typescript
+import { Queue, Worker } from "bullmq";
+import { redis } from "@/lib/redis";
+import { logger } from "@/lib/logger";
+
+export const emailQueue = new Queue("emailQueue", { connection: redis });
+
+export const emailWorker = new Worker(
+  "emailQueue",
+  async (job) => {
+    logger.info(`Processing job ${job.name} with data:`, job.data);
+    // Execute email sending logic
+  },
+  { connection: redis },
+);
+```
+
+---
+
+## 7. Complete Feature Reference Slice (`src/features/users/`)
 
 ### `src/features/users/schemas/index.ts`
 ```typescript
 import { z } from "zod";
+import { paginationQuerySchema } from "@/lib/pagination";
 
 export const createUserSchema = z.object({
   email: z.string().email("Invalid email address"),
@@ -466,47 +636,73 @@ export const userIdParamSchema = z.object({
   id: z.string().uuid("Invalid user ID"),
 });
 
+export const listUsersQuerySchema = paginationQuerySchema.extend({
+  search: z.string().optional(),
+});
+
 export type CreateUserInput = z.infer<typeof createUserSchema>;
 export type UserIdParam = z.infer<typeof userIdParamSchema>;
+export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
 ```
 
 ### `src/features/users/repositories/index.ts`
 ```typescript
 import db, { type Transaction } from "@/db";
 import { users, type User, type NewUser } from "@/db/schemas";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 export class UsersRepository {
+  // Relational Query for single read
   static async findById(id: string, tx?: Transaction): Promise<User | null> {
-    const client = tx || db;
-    const [user] = await client.select().from(users).where(eq(users.id, id));
+    const client = tx ?? db;
+    const user = await client.query.users.findFirst({
+      where: eq(users.id, id),
+    });
     return user ?? null;
   }
 
   static async findByEmail(email: string, tx?: Transaction): Promise<User | null> {
-    const client = tx || db;
-    const [user] = await client.select().from(users).where(eq(users.email, email));
+    const client = tx ?? db;
+    const user = await client.query.users.findFirst({
+      where: eq(users.email, email),
+    });
     return user ?? null;
   }
 
+  // Query Builder for writes
   static async create(data: NewUser, tx?: Transaction): Promise<User> {
-    const client = tx || db;
+    const client = tx ?? db;
     const [created] = await client.insert(users).values(data).returning();
     return created;
   }
 
-  static async list(tx?: Transaction): Promise<User[]> {
-    const client = tx || db;
-    return client.select().from(users);
+  // Paginated read
+  static async list(page: number, limit: number, tx?: Transaction): Promise<{ items: User[]; total: number }> {
+    const client = tx ?? db;
+    const offset = (page - 1) * limit;
+
+    const items = await client.query.users.findMany({
+      limit,
+      offset,
+    });
+
+    const [{ count }] = await client
+      .select({ count: sql<number>`count(*)::int` })
+      .from(users);
+
+    return { items, total: count };
   }
 }
 ```
 
 ### `src/features/users/services/index.ts`
 ```typescript
+import db from "@/db";
 import { ConflictError, NotFoundError } from "@/lib/error";
+import { formatPaginatedResult } from "@/lib/pagination";
+import { emailQueue } from "@/queues";
 import { UsersRepository } from "../repositories";
-import type { CreateUserInput } from "../schemas";
+import type { CreateUserInput, ListUsersQuery } from "../schemas";
 
 export class UsersService {
   static async getById(id: string) {
@@ -527,19 +723,32 @@ export class UsersService {
 
     const passwordHash = await Bun.password.hash(input.password, { algorithm: "argon2id" });
 
-    const created = await UsersRepository.create({
-      email: input.email,
-      fullName: input.fullName,
-      passwordHash,
+    // Multi-table or atomic operations orchestrate db.transaction
+    const safeUser = await db.transaction(async (tx) => {
+      const created = await UsersRepository.create(
+        {
+          email: input.email,
+          fullName: input.fullName,
+          passwordHash,
+        },
+        tx,
+      );
+
+      const { passwordHash: _, ...user } = created;
+      return user;
     });
 
-    const { passwordHash: _, ...safeUser } = created;
+    // Offload async heavy task to BullMQ
+    await emailQueue.add("welcomeEmail", { email: safeUser.email, name: safeUser.fullName });
+
     return safeUser;
   }
 
-  static async list() {
-    const allUsers = await UsersRepository.list();
-    return allUsers.map(({ passwordHash, ...safeUser }) => safeUser);
+  static async list(query: ListUsersQuery) {
+    const { items, total } = await UsersRepository.list(query.page, query.limit);
+    const safeItems = items.map(({ passwordHash, ...user }) => user);
+
+    return formatPaginatedResult(safeItems, total, query.page, query.limit);
   }
 }
 ```
@@ -547,22 +756,29 @@ export class UsersService {
 ### `src/features/users/routes/index.ts`
 ```typescript
 import { Hono } from "hono";
-import { validateBody, validateParams } from "@/middlewares/validate.middleware";
-import { createUserSchema, userIdParamSchema } from "../schemas";
+import type { AppEnv } from "@/types/context";
+import { validateBody, validateParams, validateQuery } from "@/middlewares/validate.middleware";
+import { authMiddleware } from "@/middlewares/auth.middleware";
+import { createUserSchema, userIdParamSchema, listUsersQuerySchema } from "../schemas";
 import { UsersService } from "../services";
 import Response from "@/lib/response";
 
-const router = new Hono();
+const router = new Hono<AppEnv>();
 
-router.get("/", async (c) => {
-  const users = await UsersService.list();
-  return Response.success(c, users);
-});
-
+// Public registration
 router.post("/", validateBody(createUserSchema), async (c) => {
   const input = c.req.valid("json");
   const user = await UsersService.create(input);
-  return Response.success(c, user, "User created successfully", 201);
+  return Response.success(c, user, "User registered successfully", 201);
+});
+
+// Protected routes
+router.use("*", authMiddleware);
+
+router.get("/", validateQuery(listUsersQuerySchema), async (c) => {
+  const query = c.req.valid("query");
+  const paginatedUsers = await UsersService.list(query);
+  return Response.success(c, paginatedUsers);
 });
 
 router.get("/:id", validateParams(userIdParamSchema), async (c) => {
@@ -572,4 +788,49 @@ router.get("/:id", validateParams(userIdParamSchema), async (c) => {
 });
 
 export default router;
+```
+
+---
+
+## 8. Testing Standards (`tests/`)
+
+### `tests/setup.ts` (Test Runner Setup)
+```typescript
+import { beforeAll, afterAll } from "bun:test";
+
+beforeAll(async () => {
+  // Setup test database or run migrations
+});
+
+afterAll(async () => {
+  // Teardown connections
+});
+```
+
+### `tests/integration/users.test.ts`
+```typescript
+import { describe, expect, it } from "bun:test";
+import { app } from "@/app";
+
+describe("Users API Integration", () => {
+  it("GET /health should return 200 ok", async () => {
+    const res = await app.request("/health");
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.status).toBe("ok");
+  });
+
+  it("POST /users with invalid email should fail validation with 422", async () => {
+    const res = await app.request("/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "bad-email", password: "123", fullName: "A" }),
+    });
+
+    expect(res.status).toBe(422);
+    const json = await res.json();
+    expect(json.ok).toBe(false);
+    expect(json.error).toBe("VALIDATION_ERROR");
+  });
+});
 ```
