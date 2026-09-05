@@ -6,18 +6,19 @@ This document provides complete, production-ready reference implementations for 
 
 ## 1. Application Entry & Bootstrap
 
-### `src/index.ts` (Bun Server Entrypoint with Graceful Shutdown)
+### `src/index.ts` (Bun Server Entrypoint with WebSockets & Graceful Shutdown)
 ```typescript
-import { app } from "@/app";
+import { app, websocket } from "@/app";
 import { env } from "@/config/env.config";
 import { pool } from "@/db";
-import { redis } from "@/lib/redis";
+import { redis, redisSub } from "@/lib/redis";
 import { emailWorker } from "@/queues";
 import { logger } from "@/lib/logger";
 
 const server = Bun.serve({
   port: env.PORT,
   fetch: app.fetch,
+  websocket,
 });
 
 logger.info(`Server running on port ${env.PORT}`);
@@ -38,8 +39,9 @@ const shutdown = async (signal: string) => {
     logger.info("Draining database connections...");
     await pool.end();
 
-    // 3. Disconnect Redis
-    logger.info("Closing Redis connection...");
+    // 3. Disconnect Redis clients
+    logger.info("Closing Redis connections...");
+    await redisSub.quit();
     await redis.quit();
 
     logger.info("Graceful shutdown completed successfully.");
@@ -74,9 +76,10 @@ export type AppEnv = {
 };
 ```
 
-### `src/app/index.ts` (Hono Application Setup)
+### `src/app/index.ts` (Hono Application & WebSocket Setup)
 ```typescript
 import { Hono } from "hono";
+import { createBunWebSocket } from "hono/bun";
 import type { AppEnv } from "@/types/context";
 import { requestIdMiddleware } from "@/middlewares/requestId.middleware";
 import { corsMiddleware } from "@/middlewares/cors.middleware";
@@ -84,6 +87,9 @@ import { loggerMiddleware } from "@/middlewares/logger.middleware";
 import { errorHandler } from "@/middlewares/errorHandler.middleware";
 import { NotFoundError } from "@/lib/error";
 import Router from "@/routes";
+import { setupWebSocketRoutes } from "@/ws";
+
+const { upgradeWebSocket, websocket } = createBunWebSocket();
 
 export const app = new Hono<AppEnv>();
 
@@ -98,8 +104,13 @@ app.notFound((c) => {
   throw new NotFoundError(`${c.req.method} ${c.req.path} Route not found`);
 });
 
+// Setup WebSocket endpoint
+setupWebSocketRoutes(app, upgradeWebSocket);
+
 // Central Router
 app.route("/", Router);
+
+export { websocket };
 ```
 
 ### `src/routes/index.ts` (Central Route Aggregator)
@@ -131,6 +142,11 @@ const envSchema = z.object({
   POSTGRESQL_URL: z.string().min(1, "POSTGRESQL_URL is required"),
   REDIS_URL: z.string().default("redis://localhost:6379"),
   JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 characters"),
+  S3_BUCKET: z.string().min(1, "S3_BUCKET is required"),
+  S3_REGION: z.string().default("auto"),
+  S3_ENDPOINT: z.string().optional(),
+  S3_ACCESS_KEY_ID: z.string().min(1, "S3_ACCESS_KEY_ID is required"),
+  S3_SECRET_ACCESS_KEY: z.string().min(1, "S3_SECRET_ACCESS_KEY is required"),
   DASHBOARD_URL: z.string().optional(),
 });
 
@@ -181,53 +197,14 @@ export class AppError extends Error {
   }
 }
 
-export class NotFoundError extends AppError {
-  constructor(message = "Not found") {
-    super(message, 404, "NOT_FOUND");
-  }
-}
-
-export class ValidationError extends AppError {
-  constructor(message = "Unprocessable Entity") {
-    super(message, 422, "VALIDATION_ERROR");
-  }
-}
-
-export class AuthorizationError extends AppError {
-  constructor(message = "Unauthorized") {
-    super(message, 401, "UNAUTHORIZED");
-  }
-}
-
-export class ForbiddenError extends AppError {
-  constructor(message = "Forbidden") {
-    super(message, 403, "FORBIDDEN");
-  }
-}
-
-export class BadRequestError extends AppError {
-  constructor(message = "Bad Request") {
-    super(message, 400, "BAD_REQUEST");
-  }
-}
-
-export class ConflictError extends AppError {
-  constructor(message = "Conflict") {
-    super(message, 409, "CONFLICT");
-  }
-}
-
-export class RateLimitError extends AppError {
-  constructor(message = "Too Many Requests") {
-    super(message, 429, "RATE_LIMITED");
-  }
-}
-
-export class ServerError extends AppError {
-  constructor(message = "An unexpected error occurred") {
-    super(message, 500, "SERVER_ERROR");
-  }
-}
+export class NotFoundError extends AppError { constructor(message = "Not found") { super(message, 404, "NOT_FOUND"); } }
+export class ValidationError extends AppError { constructor(message = "Unprocessable Entity") { super(message, 422, "VALIDATION_ERROR"); } }
+export class AuthorizationError extends AppError { constructor(message = "Unauthorized") { super(message, 401, "UNAUTHORIZED"); } }
+export class ForbiddenError extends AppError { constructor(message = "Forbidden") { super(message, 403, "FORBIDDEN"); } }
+export class BadRequestError extends AppError { constructor(message = "Bad Request") { super(message, 400, "BAD_REQUEST"); } }
+export class ConflictError extends AppError { constructor(message = "Conflict") { super(message, 409, "CONFLICT"); } }
+export class RateLimitError extends AppError { constructor(message = "Too Many Requests") { super(message, 429, "RATE_LIMITED"); } }
+export class ServerError extends AppError { constructor(message = "An unexpected error occurred") { super(message, 500, "SERVER_ERROR"); } }
 ```
 
 ### `src/lib/response.ts` (Unified Response Envelope)
@@ -236,17 +213,8 @@ import type { Context } from "hono";
 import type { ContentfulStatusCode, StatusCode } from "hono/utils/http-status";
 import type { ErrorCode } from "./error";
 
-export type SuccessResponse<T> = {
-  ok: true;
-  data?: T;
-  message?: string;
-};
-
-export type ErrorResponse = {
-  ok: false;
-  message: string;
-  error: ErrorCode;
-};
+export type SuccessResponse<T> = { ok: true; data?: T; message?: string; };
+export type ErrorResponse = { ok: false; message: string; error: ErrorCode; };
 
 class Response {
   static success<T>(
@@ -310,22 +278,105 @@ export function formatPaginatedResult<T>(
 }
 ```
 
-### `src/lib/redis.ts` (Shared Redis Client)
+### `src/lib/redis.ts` (Shared Redis Clients)
 ```typescript
 import Redis from "ioredis";
 import { env } from "@/config/env.config";
 import { logger } from "@/lib/logger";
 
-export const redis = new Redis(env.REDIS_URL, {
-  maxRetriesPerRequest: null,
-});
+export const redis = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
+export const redisSub = new Redis(env.REDIS_URL, { maxRetriesPerRequest: null });
 
-redis.on("error", (err) => {
-  logger.error("Redis connection error:", err);
-});
+redis.on("error", (err) => logger.error("Redis client error:", err));
+redisSub.on("error", (err) => logger.error("Redis subscriber error:", err));
 ```
 
-### `src/lib/logger.ts` (Colorized ANSI Logger with Request ID)
+### `src/lib/cache.ts` (Type-Safe Caching & Eviction)
+```typescript
+import { redis } from "./redis";
+import { logger } from "./logger";
+
+export const cache = {
+  async getOrSet<T>(key: string, ttlSeconds: number, fetcher: () => Promise<T>): Promise<T> {
+    try {
+      const cached = await redis.get(key);
+      if (cached) {
+        return JSON.parse(cached) as T;
+      }
+    } catch (err) {
+      logger.warn(`Cache get error for key '${key}':`, err);
+    }
+
+    const freshData = await fetcher();
+
+    try {
+      if (freshData !== null && freshData !== undefined) {
+        await redis.set(key, JSON.stringify(freshData), "EX", ttlSeconds);
+      }
+    } catch (err) {
+      logger.warn(`Cache set error for key '${key}':`, err);
+    }
+
+    return freshData;
+  },
+
+  async del(key: string): Promise<void> {
+    try {
+      await redis.del(key);
+    } catch (err) {
+      logger.warn(`Cache delete error for key '${key}':`, err);
+    }
+  },
+
+  async delPrefix(prefix: string): Promise<void> {
+    try {
+      const keys = await redis.keys(`${prefix}:*`);
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    } catch (err) {
+      logger.warn(`Cache delete prefix error for '${prefix}':`, err);
+    }
+  },
+};
+```
+
+### `src/lib/storage.ts` (Presigned URLs for S3 / Cloudflare R2)
+```typescript
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { env } from "@/config/env.config";
+
+export const s3 = new S3Client({
+  region: env.S3_REGION,
+  endpoint: env.S3_ENDPOINT,
+  credentials: {
+    accessKeyId: env.S3_ACCESS_KEY_ID,
+    secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+  },
+});
+
+export const storage = {
+  async getPresignedUploadUrl(key: string, contentType: string, expiresIn = 300) {
+    const command = new PutObjectCommand({
+      Bucket: env.S3_BUCKET,
+      Key: key,
+      ContentType: contentType,
+    });
+    return getSignedUrl(s3, command, { expiresIn });
+  },
+
+  async getPresignedDownloadUrl(key: string, expiresIn = 3600) {
+    const command = new GetObjectCommand({
+      Bucket: env.S3_BUCKET,
+      Key: key,
+    });
+    return getSignedUrl(s3, command, { expiresIn });
+  },
+};
+```
+
+### `src/lib/logger.ts` (ANSI Logger with Request ID)
 ```typescript
 const isDevelopment = process.env.NODE_ENV === "development";
 
@@ -346,42 +397,15 @@ export const logger = {
 };
 ```
 
-### `src/lib/tryCatch.ts` (Result Pattern Wrapper)
-```typescript
-type Success<T> = {
-  data: T;
-  error: null;
-};
-
-type Failure<E> = {
-  data: null;
-  error: E;
-};
-
-export type Result<T, E = Error> = Success<T> | Failure<E>;
-
-export async function tryCatch<T, E = Error>(
-  promise: Promise<T>,
-): Promise<Result<T, E>> {
-  try {
-    const data = await promise;
-    return { data, error: null };
-  } catch (error) {
-    return { data: null, error: error as E };
-  }
-}
-```
-
 ---
 
 ## 4. Middlewares (`src/middlewares/`)
 
-### `src/middlewares/requestId.middleware.ts` (Request Correlation ID)
+### `src/middlewares/requestId.middleware.ts`
 ```typescript
 import type { Context, Next } from "hono";
 
 export const requestIdMiddleware = async (c: Context, next: Next) => {
-  // Use client/proxy header or generate a new UUIDv7
   const requestId = c.req.header("X-Request-Id") || crypto.randomUUID();
   c.set("requestId", requestId);
   c.header("X-Request-Id", requestId);
@@ -389,7 +413,7 @@ export const requestIdMiddleware = async (c: Context, next: Next) => {
 };
 ```
 
-### `src/middlewares/auth.middleware.ts` (JWT Bearer Token Auth)
+### `src/middlewares/auth.middleware.ts`
 ```typescript
 import type { Context, Next } from "hono";
 import { AuthorizationError } from "@/lib/error";
@@ -405,12 +429,9 @@ export const authMiddleware = async (c: Context, next: Next) => {
 
   try {
     const [headerB64, payloadB64, signature] = token.split(".");
-    if (!headerB64 || !payloadB64 || !signature) {
-      throw new Error("Malformed token");
-    }
+    if (!headerB64 || !payloadB64 || !signature) throw new Error("Malformed token");
 
     const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString());
-
     if (payload.exp && Date.now() >= payload.exp * 1000) {
       throw new AuthorizationError("Token has expired");
     }
@@ -430,31 +451,6 @@ export const authMiddleware = async (c: Context, next: Next) => {
 };
 ```
 
-### `src/middlewares/rateLimit.middleware.ts` (Redis Sliding Window)
-```typescript
-import type { Context, Next } from "hono";
-import { redis } from "@/lib/redis";
-import { RateLimitError } from "@/lib/error";
-
-export const rateLimiter = (options: { limit: number; windowSeconds: number }) => {
-  return async (c: Context, next: Next) => {
-    const ip = c.req.header("x-forwarded-for") || "127.0.0.1";
-    const key = `ratelimit:${ip}:${c.req.path}`;
-
-    const current = await redis.incr(key);
-    if (current === 1) {
-      await redis.expire(key, options.windowSeconds);
-    }
-
-    if (current > options.limit) {
-      throw new RateLimitError(`Rate limit exceeded. Try again in ${options.windowSeconds}s.`);
-    }
-
-    await next();
-  };
-};
-```
-
 ### `src/middlewares/validate.middleware.ts`
 ```typescript
 import { ValidationError } from "@/lib/error";
@@ -464,32 +460,21 @@ import { z } from "zod";
 export const validateBody = <T extends z.ZodTypeAny>(schema: T) =>
   validator("json", (value) => {
     const result = schema.safeParse(value);
-    if (!result.success)
-      throw new ValidationError(result.error.issues[0].message);
+    if (!result.success) throw new ValidationError(result.error.issues[0].message);
     return result.data as z.infer<T>;
   });
 
 export const validateParams = <T extends z.ZodTypeAny>(schema: T) =>
   validator("param", (value) => {
     const result = schema.safeParse(value);
-    if (!result.success)
-      throw new ValidationError(result.error.issues[0].message);
+    if (!result.success) throw new ValidationError(result.error.issues[0].message);
     return result.data as z.infer<T>;
   });
 
 export const validateQuery = <T extends z.ZodTypeAny>(schema: T) =>
   validator("query", (value) => {
     const result = schema.safeParse(value);
-    if (!result.success)
-      throw new ValidationError(result.error.issues[0].message);
-    return result.data as z.infer<T>;
-  });
-
-export const validateFormData = <T extends z.ZodTypeAny>(schema: T) =>
-  validator("form", (value) => {
-    const result = schema.safeParse(value);
-    if (!result.success)
-      throw new ValidationError(result.error.issues[0].message);
+    if (!result.success) throw new ValidationError(result.error.issues[0].message);
     return result.data as z.infer<T>;
   });
 ```
@@ -505,20 +490,17 @@ import { ZodError } from "zod";
 export const errorHandler = (error: any, c: Context) => {
   const reqId = c.get("requestId") ? `[Req: ${c.get("requestId")}] ` : "";
 
-  // Handle AppError
   if (error instanceof AppError) {
     logger.error(`${reqId}${error.message}`);
     return Response.error(c, error.code, error.message, error.status);
   }
 
-  // Handle unhandled Zod errors
   if (error instanceof ZodError) {
     const message = error.issues[0]?.message || "Validation failed";
     logger.error(`${reqId}Validation Error: ${message}`);
     return Response.error(c, "VALIDATION_ERROR", message, 422);
   }
 
-  // Handle malformed JSON body errors
   if (error.message && error.message.includes("JSON")) {
     logger.error(`${reqId}${error.message}`);
     return Response.error(c, "BAD_REQUEST", "Invalid JSON", 400);
@@ -529,33 +511,6 @@ export const errorHandler = (error: any, c: Context) => {
 };
 ```
 
-### `src/middlewares/logger.middleware.ts`
-```typescript
-import type { Context, Next } from "hono";
-import { logger } from "@/lib/logger";
-
-export const loggerMiddleware = async (c: Context, next: Next) => {
-  const reqId = c.get("requestId") ? `[${c.get("requestId")}] ` : "";
-  const { method, path } = c.req;
-  await next();
-  const status = c.res.status;
-  logger.info(`${reqId}[${method}] ${path} [${status}]`);
-};
-```
-
-### `src/middlewares/cors.middleware.ts`
-```typescript
-import { isDevelopment } from "@/config/env.config";
-import { cors } from "hono/cors";
-
-export const corsMiddleware = cors({
-  origin: isDevelopment ? "*" : [],
-  allowMethods: ["POST", "GET", "OPTIONS", "PUT", "DELETE", "PATCH"],
-  allowHeaders: ["Accept", "Content-Type", "Authorization", "X-Request-Id"],
-  maxAge: 600,
-});
-```
-
 ---
 
 ## 5. Database Layer (`src/db/`)
@@ -564,16 +519,18 @@ export const corsMiddleware = cors({
 ```typescript
 import { timestamp, uuid } from "drizzle-orm/pg-core";
 
-/** Shared UUIDv7 primary key */
 export const primaryKeyUuidV7 = () => uuid("id").defaultRandom().primaryKey();
 
-/** Shared timestamps with auto-updated updatedAt */
 export const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .defaultNow()
     .$onUpdate(() => new Date())
     .notNull(),
+};
+
+export const softDelete = {
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
 };
 ```
 
@@ -597,95 +554,71 @@ export type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 export default db;
 ```
 
-### `src/db/schemas/users.schema.ts`
+### `src/db/schemas/users.schema.ts` (With Partial Unique Index)
 ```typescript
-import { pgTable, text } from "drizzle-orm/pg-core";
-import { primaryKeyUuidV7, timestamps } from "../helpers/columns";
+import { pgTable, text, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { isNull } from "drizzle-orm";
+import { primaryKeyUuidV7, timestamps, softDelete } from "../helpers/columns";
 
-export const users = pgTable("users", {
-  id: primaryKeyUuidV7(),
-  email: text("email").notNull().unique(),
-  passwordHash: text("password_hash").notNull(),
-  fullName: text("full_name").notNull(),
-  ...timestamps,
-});
+export const users = pgTable(
+  "users",
+  {
+    id: primaryKeyUuidV7(),
+    email: text("email").notNull(),
+    passwordHash: text("password_hash").notNull(),
+    fullName: text("full_name").notNull(),
+    ...timestamps,
+    ...softDelete,
+  },
+  (table) => [
+    // Unique email only among active (non-soft-deleted) users
+    uniqueIndex("users_email_active_unique").on(table.email).where(isNull(table.deletedAt)),
+    // Index on deletedAt for fast query filters
+    index("users_deleted_at_idx").on(table.deletedAt),
+  ],
+);
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 ```
 
-### `src/db/schemas/index.ts` (Central Schema Export)
-```typescript
-export * from "./users.schema";
-```
-
-### `src/db/scripts/migrate.ts`
-```typescript
-import { migrate } from "drizzle-orm/node-postgres/migrator";
-import db, { pool } from "../index";
-import { logger } from "@/lib/logger";
-
-async function runMigrations() {
-  logger.info("Running pending database migrations...");
-  await migrate(db, { migrationsFolder: "./drizzle" });
-  logger.info("Migrations applied successfully.");
-  await pool.end();
-  process.exit(0);
-}
-
-runMigrations().catch((err) => {
-  logger.error("Migration failed:", err);
-  process.exit(1);
-});
-```
-
-### `src/db/scripts/seed.ts`
-```typescript
-import db, { pool } from "../index";
-import { users } from "../schemas";
-import { logger } from "@/lib/logger";
-
-async function seed() {
-  logger.info("Seeding database...");
-  const passwordHash = await Bun.password.hash("Password123!", { algorithm: "argon2id" });
-
-  await db.insert(users).values({
-    email: "admin@example.com",
-    fullName: "System Admin",
-    passwordHash,
-  }).onConflictDoNothing();
-
-  logger.info("Seeding complete.");
-  await pool.end();
-  process.exit(0);
-}
-
-seed().catch((err) => {
-  logger.error("Seeding failed:", err);
-  process.exit(1);
-});
-```
-
 ---
 
-## 6. Background Processing & Queues (`src/queues/`)
+## 6. Real-Time WebSockets (`src/ws/`)
 
-### `src/queues/index.ts` (BullMQ Queues & Workers)
+### `src/ws/index.ts` (Hono + Bun WebSocket with Redis Pub/Sub)
 ```typescript
-import { Queue, Worker } from "bullmq";
-import { redis } from "@/lib/redis";
+import type { Hono } from "hono";
+import type { AppEnv } from "@/types/context";
+import { redis, redisSub } from "@/lib/redis";
 import { logger } from "@/lib/logger";
 
-export const emailQueue = new Queue("emailQueue", { connection: redis });
+export function setupWebSocketRoutes(app: Hono<AppEnv>, upgradeWebSocket: any) {
+  // Listen to cross-instance Redis Pub/Sub messages
+  redisSub.subscribe("broadcast:notifications", (err) => {
+    if (err) logger.error("Failed to subscribe to Redis channel:", err);
+  });
 
-export const emailWorker = new Worker(
-  "emailQueue",
-  async (job) => {
-    logger.info(`Processing job ${job.name} with data:`, job.data);
-    // Execute email sending logic
-  },
-  { connection: redis },
-);
+  app.get(
+    "/ws",
+    upgradeWebSocket((c: any) => {
+      return {
+        onOpen(event: any, ws: any) {
+          logger.info("WebSocket connection opened");
+          ws.subscribe("global-notifications");
+        },
+        onMessage(event: any, ws: any) {
+          const message = event.data.toString();
+          // Publish message to Redis for multi-instance distribution
+          redis.publish("broadcast:notifications", message);
+        },
+        onClose(event: any, ws: any) {
+          logger.info("WebSocket connection closed");
+        },
+      };
+    }),
+  );
+}
 ```
 
 ---
@@ -747,14 +680,13 @@ export class UserMapper {
 ```typescript
 import db, { type Transaction } from "@/db";
 import { users, type User, type NewUser } from "@/db/schemas";
-import { eq, sql } from "drizzle-orm";
+import { eq, isNull, and, sql } from "drizzle-orm";
 
 export class UsersRepository {
-  // Relational Query for single read
   static async findById(id: string, tx?: Transaction): Promise<User | null> {
     const client = tx ?? db;
     const user = await client.query.users.findFirst({
-      where: eq(users.id, id),
+      where: and(eq(users.id, id), isNull(users.deletedAt)),
     });
     return user ?? null;
   }
@@ -762,31 +694,39 @@ export class UsersRepository {
   static async findByEmail(email: string, tx?: Transaction): Promise<User | null> {
     const client = tx ?? db;
     const user = await client.query.users.findFirst({
-      where: eq(users.email, email),
+      where: and(eq(users.email, email), isNull(users.deletedAt)),
     });
     return user ?? null;
   }
 
-  // Query Builder for writes
   static async create(data: NewUser, tx?: Transaction): Promise<User> {
     const client = tx ?? db;
     const [created] = await client.insert(users).values(data).returning();
     return created;
   }
 
-  // Paginated read
+  static async softDelete(id: string, tx?: Transaction): Promise<void> {
+    const client = tx ?? db;
+    await client
+      .update(users)
+      .set({ deletedAt: new Date() })
+      .where(and(eq(users.id, id), isNull(users.deletedAt)));
+  }
+
   static async list(page: number, limit: number, tx?: Transaction): Promise<{ items: User[]; total: number }> {
     const client = tx ?? db;
     const offset = (page - 1) * limit;
 
     const items = await client.query.users.findMany({
+      where: isNull(users.deletedAt),
       limit,
       offset,
     });
 
     const [{ count }] = await client
       .select({ count: sql<number>`count(*)::int` })
-      .from(users);
+      .from(users)
+      .where(isNull(users.deletedAt));
 
     return { items, total: count };
   }
@@ -797,28 +737,26 @@ export class UsersRepository {
 ```typescript
 import db from "@/db";
 import { ConflictError, NotFoundError } from "@/lib/error";
+import { cache } from "@/lib/cache";
 import { emailQueue } from "@/queues";
 import { UsersRepository } from "../repositories";
 import type { CreateUserInput, ListUsersQuery } from "../schemas";
 
 export class UsersService {
   static async getById(id: string) {
-    const user = await UsersRepository.findById(id);
-    if (!user) {
-      throw new NotFoundError(`User with id '${id}' not found`);
-    }
-    return user;
+    return cache.getOrSet(`users:${id}`, 1800, async () => {
+      const user = await UsersRepository.findById(id);
+      if (!user) throw new NotFoundError(`User with id '${id}' not found`);
+      return user;
+    });
   }
 
   static async create(input: CreateUserInput) {
     const existing = await UsersRepository.findByEmail(input.email);
-    if (existing) {
-      throw new ConflictError("Email already registered");
-    }
+    if (existing) throw new ConflictError("Email already registered");
 
     const passwordHash = await Bun.password.hash(input.password, { algorithm: "argon2id" });
 
-    // Multi-table or atomic operations orchestrate db.transaction
     const createdUser = await db.transaction(async (tx) => {
       return UsersRepository.create(
         {
@@ -830,10 +768,17 @@ export class UsersService {
       );
     });
 
-    // Offload async heavy task to BullMQ
     await emailQueue.add("welcomeEmail", { email: createdUser.email, name: createdUser.fullName });
 
     return createdUser;
+  }
+
+  static async delete(id: string) {
+    const existing = await UsersRepository.findById(id);
+    if (!existing) throw new NotFoundError("User not found");
+
+    await UsersRepository.softDelete(id);
+    await cache.del(`users:${id}`);
   }
 
   static async list(query: ListUsersQuery) {
@@ -882,6 +827,12 @@ router.get("/:id", validateParams(userIdParamSchema), async (c) => {
   return Response.success(c, response);
 });
 
+router.delete("/:id", validateParams(userIdParamSchema), async (c) => {
+  const { id } = c.req.valid("param");
+  await UsersService.delete(id);
+  return Response.empty(c, 204);
+});
+
 export default router;
 ```
 
@@ -893,14 +844,15 @@ export default router;
 ```typescript
 import { beforeAll, afterAll } from "bun:test";
 import { pool } from "@/db";
-import { redis } from "@/lib/redis";
+import { redis, redisSub } from "@/lib/redis";
 
 beforeAll(async () => {
-  // Setup test database / migrations if necessary
+  // Setup test environment
 });
 
 afterAll(async () => {
   await pool.end();
+  await redisSub.quit();
   await redis.quit();
 });
 ```
