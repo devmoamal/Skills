@@ -23,6 +23,10 @@ Request ──> Middlewares (CORS, RequestId, Logger, RateLimit, Auth)
 
 Every endpoint, query, service, background job, and WebSocket must adhere to uncompromising type safety, strict separation of concerns, and clean production hygiene.
 
+> **Quick References**:
+> - [rules.md](./rules.md) — Drop-in compact project rules for `.agents/rules/` or `.cursorrules`.
+> - [templates.md](./references/templates.md) — Production-ready reference implementations.
+
 ---
 
 ## Operating Modes
