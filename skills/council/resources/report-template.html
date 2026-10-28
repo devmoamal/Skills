@@ -1,0 +1,91 @@
+<!--
+  COUNCIL REPORT TEMPLATE (optional deliverable — only generate when the user asks)
+
+  FILL RULES (mandatory):
+  1. Build this from the finished transcript, never from memory.
+  2. HTML-escape every inserted string: & → &amp;   < → &lt;   > → &gt;   " → &quot;
+  3. Convert markdown before inserting: blank-line paragraphs → <p>, "- item" lines → <ul><li>,
+     **bold** → <strong>, `code` → <code>. Never leave raw ** or # characters in the page.
+  4. Replace every {{PLACEHOLDER}}. Search the file for "{{" before saving — zero must remain.
+  5. Stance pills: for each advisor, set the class to one of  for | against | mixed | reframe
+     based on their "Bottom line:" sentence, and put that sentence (escaped) in the pill text.
+  6. Save as <artifactDir>/council-<ts>.html (UTF-8). Link it in chat; do not ask to open it.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Council Report — {{TITLE}}</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg:#f8fafc; --card:#ffffff; --border:#e2e8f0; --text:#0f172a; --muted:#64748b;
+    --accent:#0284c7; --green:#16a34a; --red:#dc2626; --amber:#d97706; --purple:#7c3aed; }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg:#0f172a; --card:#1e293b; --border:#334155; --text:#f1f5f9; --muted:#94a3b8;
+    --accent:#38bdf8; --green:#4ade80; --red:#f87171; --amber:#fbbf24; --purple:#c084fc; } }
+  * { box-sizing:border-box; }
+  body { font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text);
+    line-height:1.6; max-width:880px; margin:0 auto; padding:2rem 1.25rem; }
+  header { border-bottom:1px solid var(--border); padding-bottom:1.25rem; margin-bottom:1.5rem; }
+  h1 { font-size:1.6rem; margin:.4rem 0; }
+  h2 { font-size:1.1rem; margin:0 0 .6rem; }
+  .meta { color:var(--muted); font-size:.85rem; }
+  .tag { display:inline-block; font-size:.7rem; font-weight:700; letter-spacing:.05em; text-transform:uppercase;
+    color:var(--accent); border:1px solid var(--accent); border-radius:999px; padding:.1rem .6rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1.25rem; margin-bottom:1rem; }
+  .rec { border-left:4px solid var(--accent); }
+  .first { border-left:4px solid var(--green); }
+  .conf { color:var(--muted); font-size:.9rem; margin-top:.5rem; }
+  .stances { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:.6rem; margin-bottom:1rem; }
+  .pill { background:var(--card); border:1px solid var(--border); border-top:4px solid var(--muted); border-radius:10px; padding:.7rem; font-size:.85rem; }
+  .pill b { display:block; margin-bottom:.25rem; }
+  .pill.for { border-top-color:var(--green); } .pill.against { border-top-color:var(--red); }
+  .pill.mixed { border-top-color:var(--amber); } .pill.reframe { border-top-color:var(--purple); }
+  details { background:var(--card); border:1px solid var(--border); border-radius:10px; margin-bottom:.6rem; }
+  summary { padding:.8rem 1rem; font-weight:600; cursor:pointer; }
+  .body { padding:0 1rem 1rem; border-top:1px solid var(--border); }
+  footer { color:var(--muted); font-size:.8rem; text-align:center; margin-top:2rem; }
+</style>
+</head>
+<body>
+<header>
+  <span class="tag">LLM Council</span>
+  <h1>{{TITLE}}</h1>
+  <div class="meta">{{TIMESTAMP}} · {{MODE}} mode · {{ADVISOR_COUNT}} advisors · {{REVIEWER_COUNT}} reviewers</div>
+</header>
+
+<section class="card rec">
+  <h2>The Recommendation</h2>
+  {{RECOMMENDATION_HTML}}
+  <div class="conf"><strong>Confidence:</strong> {{CONFIDENCE}} · <strong>Would flip if:</strong> {{FLIP}} · <strong>Revisit:</strong> {{REVISIT}}</div>
+</section>
+
+<section class="card first">
+  <h2>The One Thing to Do First</h2>
+  {{FIRST_ACTION_HTML}}
+</section>
+
+<div class="stances">
+  <div class="pill {{CONTRARIAN_STANCE}}"><b>Contrarian</b>{{CONTRARIAN_BOTTOM_LINE}}</div>
+  <div class="pill {{FIRSTPRINCIPLES_STANCE}}"><b>First Principles</b>{{FIRSTPRINCIPLES_BOTTOM_LINE}}</div>
+  <div class="pill {{EXPANSIONIST_STANCE}}"><b>Expansionist</b>{{EXPANSIONIST_BOTTOM_LINE}}</div>
+  <div class="pill {{OUTSIDER_STANCE}}"><b>Outsider</b>{{OUTSIDER_BOTTOM_LINE}}</div>
+  <div class="pill {{EXECUTOR_STANCE}}"><b>Executor</b>{{EXECUTOR_BOTTOM_LINE}}</div>
+</div>
+
+<section class="card"><h2>Where the Council Agrees</h2>{{AGREES_HTML}}</section>
+<section class="card"><h2>Where the Council Clashes</h2>{{CLASHES_HTML}}</section>
+<section class="card"><h2>Blind Spots Caught in Review</h2>{{BLINDSPOTS_HTML}}</section>
+
+<h2 style="margin:1.5rem 0 .75rem">Full deliberations</h2>
+<details><summary>The Contrarian</summary><div class="body">{{CONTRARIAN_HTML}}</div></details>
+<details><summary>The First Principles Thinker</summary><div class="body">{{FIRSTPRINCIPLES_HTML}}</div></details>
+<details><summary>The Expansionist</summary><div class="body">{{EXPANSIONIST_HTML}}</div></details>
+<details><summary>The Outsider</summary><div class="body">{{OUTSIDER_HTML}}</div></details>
+<details><summary>The Executor</summary><div class="body">{{EXECUTOR_HTML}}</div></details>
+<details><summary>Peer reviews (raw, with anonymization key)</summary><div class="body">{{REVIEWS_HTML}}</div></details>
+
+<footer>Question: {{RAW_PROMPT_SHORT}} · Methodology: Andrej Karpathy's LLM Council</footer>
+</body>
+</html>
